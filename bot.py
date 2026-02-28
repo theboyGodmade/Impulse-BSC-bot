@@ -69,6 +69,11 @@ MAX_SELL_RATIO_1H        = 0.65
 MIN_LIQ_TO_MCAP          = 0.08
 MAX_PRICE_DROP_1H        = -25
 
+# New pair detection
+NEW_PAIR_MAX_AGE_HOURS   = 48       # pairs under 48h old = new pair
+NEW_PAIR_MIN_LIQUIDITY   = 3_000    # $3k min liquidity for new pairs
+NEW_PAIR_MIN_SCORE       = 60       # score threshold for new pair alerts
+
 # Cooldowns
 ALERT_COOLDOWN           = 5400     # 90 min cooldown per token
 SCAN_INTERVAL            = 75       # scan every 75 seconds
@@ -77,6 +82,7 @@ SCAN_INTERVAL            = 75       # scan every 75 seconds
 alerted_tokens   = {}   # addr -> last alert timestamp
 token_history    = {}   # addr -> {vol_1h, vol_24h, price, holders, timestamp, scan_count}
 subscribed_chats = set()
+seen_new_pairs   = set()  # track pairs we've already seen as "new"
 
 
 # ── DEX SCREENER HELPERS ──────────────────────────────────────────────────────
@@ -178,8 +184,81 @@ async def fetch_all_bsc_pairs(session: aiohttp.ClientSession) -> list:
                 results.append(pair)
             await asyncio.sleep(0.1)  # small delay to avoid rate limiting
 
+    # Strategy 6: Volume spike discovery — scans ALL BSC pairs sorted by
+    # trending score on 1h timeframe. Key fix for sleeping giants that never
+    # appear in profile/boost feeds.
+    try:
+        for page in range(1, 4):
+            data = await dex_get(
+                session,
+                f"https://api.dexscreener.com/latest/dex/search?q=pancakeswap&rankBy=trendingScoreH1&order=desc&page={page}"
+            )
+            if data and "pairs" in data:
+                bsc = [p for p in data["pairs"] if p.get("chainId") == "bsc"]
+                add_pairs(bsc)
+            await asyncio.sleep(0.2)
+    except Exception as e:
+        logger.warning(f"Volume spike discovery error: {e}")
+
+    # Strategy 7: PancakeSwap pairs sorted by 1h volume
+    try:
+        data = await dex_get(session, "https://api.dexscreener.com/latest/dex/pairs/bsc/pancakeswap-v2")
+        if data and "pairs" in data:
+            pairs_sorted = sorted(
+                data["pairs"],
+                key=lambda x: float(x.get("volume", {}).get("h1", 0) or 0),
+                reverse=True
+            )
+            add_pairs(pairs_sorted[:80])
+    except Exception as e:
+        logger.warning(f"PancakeSwap v2 direct fetch error: {e}")
+
     logger.info(f"Total BSC pairs collected: {len(results)}")
     return results
+
+
+# ── GMGN HOLDER CHECK ─────────────────────────────────────────────────────────
+
+async def gmgn_holders(session: aiohttp.ClientSession, address: str):
+    try:
+        url = f"https://gmgn.ai/defi/quotation/v1/tokens/bsc/{address}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data = await r.json()
+                token_data = data.get("data", {}).get("token", {})
+                holders = token_data.get("holder_count") or token_data.get("holders")
+                if holders:
+                    return int(holders)
+    except Exception as e:
+        logger.warning(f"GMGN holder fetch error: {e}")
+    return None
+
+
+# ── NEW PAIR DETECTION ────────────────────────────────────────────────────────
+
+def is_new_pair(pair_data: dict) -> tuple:
+    """
+    Returns (is_new, age_str)
+    Flags pairs launched in the last 48 hours with strong early signals
+    """
+    created_ts = pair_data.get("pairCreatedAt")
+    if not created_ts:
+        return False, ""
+
+    age_hrs = (time.time() - int(created_ts) / 1000) / 3600
+
+    if age_hrs > NEW_PAIR_MAX_AGE_HOURS:
+        return False, ""
+
+    if age_hrs < 1:
+        age_str = f"{round(age_hrs * 60)}m old"
+    elif age_hrs < 24:
+        age_str = f"{round(age_hrs, 1)}h old"
+    else:
+        age_str = f"{round(age_hrs/24, 1)} days old"
+
+    return True, age_str
 
 
 # ── SECURITY ──────────────────────────────────────────────────────────────────
@@ -538,7 +617,9 @@ async def build_report(
     session: aiohttp.ClientSession,
     pair_data: dict,
     is_waking: bool,
-    wake_signal: str
+    wake_signal: str,
+    is_new: bool = False,
+    new_age_str: str = "",
 ) -> str:
     addr      = pair_data.get("baseToken", {}).get("address", "")
     name      = pair_data.get("baseToken", {}).get("name", "Unknown")
@@ -584,10 +665,11 @@ async def build_report(
     acc  = accumulation_score(pair_data, prev, is_waking)
     viral = virality_score(pair_data)
 
-    hp_data, source, gp_data = await asyncio.gather(
+    hp_data, source, gp_data, gmgn_count = await asyncio.gather(
         honeypot_check(session, addr),
         get_contract_source(session, addr),
         goplus_check(session, addr),
+        gmgn_holders(session, addr),
     )
 
     hp           = hp_data or {}
@@ -604,8 +686,31 @@ async def build_report(
     is_mintable   = gp.get("is_mintable", "0") == "1"
     is_proxy      = gp.get("is_proxy", "0") == "1"
     hidden_owner  = gp.get("hidden_owner", "0") == "1"
-    holder_count  = gp.get("holder_count", "Unknown")
+    gp_holder_count = gp.get("holder_count")
     top10_pct     = float(gp.get("top_10_holder_rate", 0) or 0) * 100
+
+    # Cross-reference holder count from GMGN vs GoPlus
+    # Use whichever is higher — DexScreener often undercounts
+    holder_sources = {}
+    if gp_holder_count:
+        holder_sources["GoPlus"] = int(gp_holder_count)
+    if gmgn_count:
+        holder_sources["GMGN"] = int(gmgn_count)
+
+    if holder_sources:
+        best_holder_count = max(holder_sources.values())
+        if len(holder_sources) == 2:
+            gp_val = holder_sources.get("GoPlus", 0)
+            gm_val = holder_sources.get("GMGN", 0)
+            discrepancy = abs(gp_val - gm_val)
+            holder_display = f"{best_holder_count:,} (GoPlus: {gp_val:,} | GMGN: {gm_val:,})"
+            if discrepancy > gp_val * 0.5 and discrepancy > 50:
+                holder_display += " ⚠️ Sources disagree"
+        else:
+            src = list(holder_sources.keys())[0]
+            holder_display = f"{best_holder_count:,} (via {src})"
+    else:
+        holder_display = "Unknown"
 
     dump_flag, dump_reason = is_dump_pattern(pair_data)
     risk         = risk_rating(is_honeypot, contract["score"], top10_pct, gp)
@@ -615,7 +720,12 @@ async def build_report(
 
     is_micro = 0 < mkt_cap <= MICRO_CAP_MAX
     mc_tag   = "💎 MICRO CAP" if is_micro else "📊 STANDARD"
-    alert_type = "💤🔥 SLEEPING GIANT" if is_waking else "📡 ACCUMULATION ALERT"
+    if is_new:
+        alert_type = f"🆕 NEW PAIR — {new_age_str}"
+    elif is_waking:
+        alert_type = "💤🔥 SLEEPING GIANT"
+    else:
+        alert_type = "📡 ACCUMULATION ALERT"
 
     contract_flags = "\n".join(contract["flags"]) if contract["flags"] else "✅ No dangerous functions"
 
@@ -662,7 +772,7 @@ async def build_report(
         f"💸 Buy tax: {f'{buy_tax_hp}%' if buy_tax_hp is not None else 'N/A'} | "
         f"Sell tax: {f'{sell_tax_hp}%' if sell_tax_hp is not None else 'N/A'}\n"
         f"🐋 Top 10 holders: {round(top10_pct, 1)}%\n"
-        f"👥 Total holders: {holder_count}\n"
+        f"👥 Holders: {holder_display}\n"
         f"🔬 Contract score: {contract['score']}/100\n"
         f"{contract_flags}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -716,6 +826,7 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
                     "vol_1h": vol_1h,
                     "vol_24h": vol_24h,
                     "price": pair_data.get("priceUsd"),
+                    "ticker": pair_data.get("baseToken", {}).get("symbol", "???"),
                     "timestamp": time.time(),
                     "scan_count": prev.get("scan_count", 0) + 1,
                 }
@@ -728,11 +839,16 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
                 token_history[addr] = {
                     "vol_1h": vol_1h, "vol_24h": vol_24h,
                     "price": pair_data.get("priceUsd"),
+                    "ticker": pair_data.get("baseToken", {}).get("symbol", "???"),
                     "timestamp": time.time(),
                     "scan_count": prev.get("scan_count", 0) + 1,
                 }
                 logger.info(f"Dump filtered: {addr[:8]} — {dump_reason}")
                 continue
+
+            # New pair detection
+            is_new, new_age_str = is_new_pair(pair_data)
+            is_new_unseen = is_new and addr not in seen_new_pairs
 
             # Sleeping giant detection
             prev = token_history.get(addr)
@@ -746,13 +862,23 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
                 "vol_1h": vol_1h,
                 "vol_24h": vol_24h,
                 "price": pair_data.get("priceUsd"),
+                    "ticker": pair_data.get("baseToken", {}).get("symbol", "???"),
                 "timestamp": time.time(),
                 "scan_count": (prev.get("scan_count", 0) if prev else 0) + 1,
             }
 
             # Determine if we should alert
-            min_score = MIN_SCORE_WAKE if is_waking else MIN_SCORE_STANDARD
-            if acc["score"] < min_score and not is_waking:
+            should_alert = False
+
+            if is_new_unseen and liq >= NEW_PAIR_MIN_LIQUIDITY and acc["score"] >= NEW_PAIR_MIN_SCORE:
+                should_alert = True
+                seen_new_pairs.add(addr)
+            elif is_waking and acc["score"] >= MIN_SCORE_WAKE:
+                should_alert = True
+            elif acc["score"] >= MIN_SCORE_STANDARD:
+                should_alert = True
+
+            if not should_alert:
                 continue
 
             # Cooldown
@@ -760,8 +886,8 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
                 continue
 
             # Build and send
-            logger.info(f"ALERT {name if (name := pair_data.get('baseToken',{}).get('name','?')) else addr[:8]} | score={acc['score']} | waking={is_waking} | mc=${mkt_cap:,.0f}")
-            report = await build_report(session, pair_data, is_waking, wake_signal)
+            logger.info(f"ALERT {pair_data.get('baseToken',{}).get('name','?')} | score={acc['score']} | new={is_new_unseen} | waking={is_waking} | mc=${mkt_cap:,.0f}")
+            report = await build_report(session, pair_data, is_waking, wake_signal, is_new_unseen, new_age_str)
             alerted_tokens[addr] = time.time()
 
             for chat_id in list(subscribed_chats):
@@ -791,6 +917,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• PancakeSwap v2 + v3\n"
         "• ApeSwap, BiSwap, BabySwap, MDEX + more\n\n"
         "What this bot hunts:\n"
+        "• 🆕 New pairs (under 48h) with strong early signals\n"
         "• 💤🔥 Sleeping tokens waking up — ANY age\n"
         "• 💎 Micro caps showing first volume ($5k-$50k)\n"
         "• 📈 Genuine accumulation patterns\n"
@@ -829,6 +956,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"*BSC SCANNER FILTERS*\n\n"
+        f"🆕 *New Pair Detection (under 48h old)*\n"
+        f"  Min liquidity: ${NEW_PAIR_MIN_LIQUIDITY:,}\n"
+        f"  Min score: {NEW_PAIR_MIN_SCORE}/100\n\n"
         f"💤 *Sleeping Giant Detection*\n"
         f"  Previous vol must be under: ${WAKE_PREV_MAX_VOL:,}\n"
         f"  Wake-up min volume: ${WAKE_MIN_VOLUME_USD:,}/hr\n"
@@ -854,15 +984,19 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tokens in memory yet. Give it a few scan cycles.")
         return
 
-    # Show top 20 most recently active
+    # Show top 20 most active sorted by 1h volume
     sorted_tokens = sorted(token_history.items(), key=lambda x: x[1].get("vol_1h", 0), reverse=True)[:20]
-    lines = ["*TOP 20 TRACKED TOKENS BY VOLUME*\n"]
+    lines = ["*TOP 20 TRACKED TOKENS*\n"]
     for addr, h in sorted_tokens:
-        vol = h.get("vol_1h", 0)
-        scans = h.get("scan_count", 0)
-        lines.append(f"`{addr[:8]}...` | Vol 1h: ${vol:,.0f} | Scans: {scans}")
+        vol    = h.get("vol_1h", 0)
+        scans  = h.get("scan_count", 0)
+        ticker = h.get("ticker", "???")
+        dex_link = f"https://dexscreener.com/bsc/{addr}"
+        lines.append(
+            f"[${ticker}]({dex_link})\n`{addr}` | Vol 1h: ${vol:,.0f} | Scans: {scans}"
+        )
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
