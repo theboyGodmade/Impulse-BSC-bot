@@ -1,32 +1,23 @@
 """
-BSC MEME SCANNER BOT v4
-- Direct BSC RPC monitoring (GetBlock + Ankr) — finds tokens DexScreener never surfaces
-- Monitors ALL tokens regardless of age — old tokens waking up is the priority
-- One alert per token permanently, unless:
-    • User taps 👁 eye button on the alert
-    • Token is in /fav list
-  Re-alert threshold: 50% move from last alert price
-- Accurate top 10 holders from BSCScan API
-- Accurate dev holding from deployer wallet balance
-- DEX paid status from DexScreener boosts
-- Watchlist shows MCap
-- Full menu bar, favourites, pinned board
+BSC MEME SCANNER BOT v5
+Core upgrade: Reserve monitoring for old token detection
+- Builds a database of ALL PancakeSwap pairs from last 30 days via BSCScan
+- Monitors on-chain reserves via RPC — catches movement before DexScreener
+- A 21-day old CTO waking up is detected the moment reserves change
+- One alert per token permanently (unless in favlist → 50% move re-alerts)
+- ⭐ button on alerts adds token directly to favlist
+- Correct MC labels
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
 from typing import Optional
 
 import aiohttp
-from telegram import (
-    Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
-)
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
 logging.basicConfig(
@@ -40,24 +31,22 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8623651466:AAFeEHh3t15n1ciB4L2MZbj
 BSCSCAN_KEY    = os.getenv("ETHERSCAN_KEY",  "S3ZEIA898K31SY9EJXE3HYY8ZEZ6PBGMHB")
 BSCSCAN_URL    = "https://api.bscscan.com/api"
 
-# RPC endpoints — primary GetBlock, fallback Ankr
 RPC_ENDPOINTS = [
     "https://go.getblock.us/75254fd9f61c4b43af30f2e55be8f55d",
     "https://rpc.ankr.com/bsc/0f0dde5ab6eee670d869cfe84af8d17eab6b832a050e17b3241f9b0dc513f1e5",
 ]
 
-# PancakeSwap V2 Factory — most BSC memes launch here
-PANCAKE_V2_FACTORY  = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-PANCAKE_V3_FACTORY  = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
-# PairCreated(address,address,address,uint256) topic
-PAIR_CREATED_TOPIC  = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
-# WBNB address (filter out BNB pairs that aren't memes)
-WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c".lower()
+# PancakeSwap V2 factory + events
+PANCAKE_V2_FACTORY = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
+PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
+WBNB               = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+
+# getReserves() selector
+GET_RESERVES_SELECTOR = "0x0902f1ac"
 
 # ── THRESHOLDS ────────────────────────────────────────────────────────────────
 MIN_LIQ_MICRO        = 1_500
 MIN_LIQ_STD          = 4_000
-MICRO_CAP_MAX        = 500_000
 
 MIN_SCORE_NEW        = 35
 MIN_SCORE_WAKE       = 40
@@ -73,52 +62,89 @@ MIN_LIQ_MCAP         = 0.04
 MAX_DROP_1H          = -40
 
 FAV_ALERT_PCT        = 50
-WATCH_ALERT_PCT      = 50
-FAV_CHECK_INTERVAL   = 120
+
+# Reserve monitoring
+RESERVE_CHANGE_PCT   = 3.0    # % change in reserves to flag as activity
+RESERVE_MIN_STABLE   = 4      # must be stable for this many checks before flagging
+RESERVE_BATCH_SIZE   = 60     # pairs to check per reserve scan cycle
+DB_BUILD_BATCH       = 100    # pairs to add to DB per BSCScan query
+DB_LOOKBACK_DAYS     = 30     # how far back to look for old pairs
+BSC_BLOCKS_PER_DAY   = 28_800 # ~3s per block
+
 SCAN_INTERVAL        = 60
-RPC_SCAN_INTERVAL    = 30   # RPC new-pair scan runs faster
+RPC_NEW_PAIR_INTERVAL = 30
+RESERVE_SCAN_INTERVAL = 45
+DB_BUILD_INTERVAL    = 300    # rebuild/extend DB every 5 mins
+FAV_CHECK_INTERVAL   = 120
+
+# ── MC LABELS ─────────────────────────────────────────────────────────────────
+def mc_label(mc: float) -> str:
+    if mc <= 0:       return ""
+    if mc < 20_000:   return "🔬 MICRO"
+    if mc < 100_000:  return "💎 LOW"
+    if mc < 200_000:  return "📊 LOW-MID"
+    if mc < 1_000_000: return "📈 MID CAP"
+    if mc < 20_000_000: return "🔥 HIGH CAP"
+    return "🏆 VERY HIGH"
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 subscribed_chats = set()
-alerted_tokens   = {}   # addr -> {ts, price}  — permanent, no re-alert unless watched/fav
+alerted_tokens   = {}   # addr -> {ts, price}
 token_history    = {}   # addr -> snapshot
 seen_new_pairs   = set()
-watched_tokens   = {}   # chat_id -> {addr -> alert_price}  (eye button)
 favourites       = {}   # chat_id -> {addr -> info}
 pinned_msg_ids   = {}   # chat_id -> message_id
-last_rpc_block   = 0    # track last scanned block
+
+# Reserve monitoring state
+pair_database    = {}   # pair_addr -> token_addr  (our local DB of old pairs)
+pair_reserves    = {}   # pair_addr -> {r0, r1, stable_count, last_ts, alerted}
+db_scan_pointer  = 0    # rotating index into pair_database for batch scanning
+last_rpc_block   = 0    # for new pair RPC detection
 
 
-# ── RPC HELPERS ───────────────────────────────────────────────────────────────
+# ── RPC ───────────────────────────────────────────────────────────────────────
 
-async def rpc_call(session: aiohttp.ClientSession, method: str, params: list) -> Optional[dict]:
-    """Call BSC RPC, try primary then fallback"""
+async def rpc_call(session: aiohttp.ClientSession, method: str, params: list) -> Optional[object]:
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     for endpoint in RPC_ENDPOINTS:
         try:
-            async with session.post(
-                endpoint,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
+            async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     data = await r.json()
                     if "result" in data:
                         return data["result"]
         except Exception as e:
-            logger.warning(f"RPC error {endpoint[:40]}: {e}")
+            logger.warning(f"RPC {endpoint[:40]}: {e}")
     return None
 
 
-async def rpc_block_number(session: aiohttp.ClientSession) -> Optional[int]:
-    result = await rpc_call(session, "eth_blockNumber", [])
-    if result:
-        return int(result, 16)
-    return None
+async def rpc_block_number(session) -> Optional[int]:
+    r = await rpc_call(session, "eth_blockNumber", [])
+    return int(r, 16) if r else None
 
 
-async def rpc_get_logs(session: aiohttp.ClientSession, from_block: int, to_block: int) -> list:
-    """Get PairCreated events from PancakeSwap V2 factory"""
+async def rpc_get_reserves(session, pair_addr: str) -> Optional[tuple]:
+    """
+    Call getReserves() on a PancakeSwap V2 pair.
+    Returns (reserve0, reserve1) or None.
+    """
+    result = await rpc_call(session, "eth_call", [
+        {"to": pair_addr, "data": GET_RESERVES_SELECTOR},
+        "latest"
+    ])
+    if not result or result == "0x" or len(result) < 194:
+        return None
+    try:
+        # Result is 3 x 32-byte values: reserve0, reserve1, blockTimestampLast
+        data = result[2:]  # strip 0x
+        r0 = int(data[0:64], 16)
+        r1 = int(data[64:128], 16)
+        return r0, r1
+    except Exception:
+        return None
+
+
+async def rpc_get_logs(session, from_block: int, to_block: int) -> list:
     params = [{
         "fromBlock": hex(from_block),
         "toBlock": hex(to_block),
@@ -129,13 +155,10 @@ async def rpc_get_logs(session: aiohttp.ClientSession, from_block: int, to_block
     return result if isinstance(result, list) else []
 
 
-async def rpc_balance_of(session: aiohttp.ClientSession, token: str, wallet: str) -> Optional[int]:
-    """Get token balance of a wallet via eth_call"""
-    # balanceOf(address) selector = 0x70a08231
+async def rpc_balance_of(session, token: str, wallet: str) -> Optional[int]:
     padded = wallet.replace("0x", "").zfill(64)
-    data = f"0x70a08231{padded}"
     result = await rpc_call(session, "eth_call", [
-        {"to": token, "data": data},
+        {"to": token, "data": f"0x70a08231{padded}"},
         "latest"
     ])
     if result and result != "0x":
@@ -146,8 +169,7 @@ async def rpc_balance_of(session: aiohttp.ClientSession, token: str, wallet: str
     return None
 
 
-async def rpc_total_supply(session: aiohttp.ClientSession, token: str) -> Optional[int]:
-    """Get total supply via eth_call"""
+async def rpc_total_supply(session, token: str) -> Optional[int]:
     result = await rpc_call(session, "eth_call", [
         {"to": token, "data": "0x18160ddd"},
         "latest"
@@ -160,51 +182,263 @@ async def rpc_total_supply(session: aiohttp.ClientSession, token: str) -> Option
     return None
 
 
-def parse_pair_created_log(log: dict) -> Optional[str]:
-    """
-    Extract token address from PairCreated log.
-    Topics: [event_sig, token0, token1]
-    Data: [pair_address, uint256]
-    Token is whichever of token0/token1 is NOT WBNB
-    """
+def parse_pair_log(log: dict) -> Optional[tuple]:
+    """Extract (pair_addr, token_addr) from PairCreated log"""
     try:
         topics = log.get("topics", [])
         if len(topics) < 3:
             return None
         token0 = "0x" + topics[1][-40:]
         token1 = "0x" + topics[2][-40:]
-        # Return the non-WBNB token
+        # Pair address is in data (first 32 bytes)
+        data = log.get("data", "")
+        if len(data) >= 66:
+            pair_addr = "0x" + data[26:66]
+        else:
+            return None
+        # Token is whichever is not WBNB
         if token0.lower() == WBNB:
-            return token1
+            return pair_addr.lower(), token1.lower()
         if token1.lower() == WBNB:
-            return token0
-        # If neither is WBNB, return token0 (still valid, just non-BNB pair)
-        return token0
+            return pair_addr.lower(), token0.lower()
+        return pair_addr.lower(), token0.lower()
     except Exception:
         return None
 
 
+# ── DATABASE BUILDER ──────────────────────────────────────────────────────────
+
+async def build_pair_database(session: aiohttp.ClientSession):
+    """
+    Query BSCScan for PairCreated events going back 30 days.
+    Adds pairs to pair_database. Called periodically to keep DB fresh.
+    Batched to respect BSCScan rate limits.
+    """
+    global pair_database
+
+    current_block = await rpc_block_number(session)
+    if not current_block:
+        return
+
+    lookback_blocks = DB_LOOKBACK_DAYS * BSC_BLOCKS_PER_DAY
+    from_block = current_block - lookback_blocks
+
+    existing = len(pair_database)
+
+    try:
+        # BSCScan getLogs for PairCreated on PancakeSwap V2 factory
+        # Page through results to build the database
+        for page in range(1, 6):  # up to 5 pages = 500 pairs per build cycle
+            url = (
+                f"{BSCSCAN_URL}?module=logs&action=getLogs"
+                f"&address={PANCAKE_V2_FACTORY}"
+                f"&topic0={PAIR_CREATED_TOPIC}"
+                f"&fromBlock={from_block}&toBlock=latest"
+                f"&page={page}&offset={DB_BUILD_BATCH}"
+                f"&apikey={BSCSCAN_KEY}"
+            )
+            data = await http_get(session, url)
+            if not data or data.get("status") != "1":
+                break
+
+            logs = data.get("result", [])
+            if not logs:
+                break
+
+            added = 0
+            for log in logs:
+                parsed = parse_pair_log(log)
+                if parsed:
+                    pair_addr, token_addr = parsed
+                    if pair_addr not in pair_database:
+                        pair_database[pair_addr] = token_addr
+                        added += 1
+
+            logger.info(f"DB build page {page}: +{added} pairs (total: {len(pair_database)})")
+            await asyncio.sleep(0.3)  # respect rate limit
+
+    except Exception as e:
+        logger.warning(f"DB build error: {e}")
+
+    new_total = len(pair_database)
+    if new_total > existing:
+        logger.info(f"Pair DB: {existing} → {new_total} pairs (+{new_total - existing})")
+
+
+# ── RESERVE MONITOR ───────────────────────────────────────────────────────────
+
+async def scan_reserves(session: aiohttp.ClientSession, app: Application):
+    """
+    Core sleeping giant detector.
+    Scans a rotating batch of pairs from pair_database.
+    Calls getReserves() on each, detects movement after silence.
+    """
+    global db_scan_pointer
+
+    if not pair_database or not subscribed_chats:
+        return
+
+    pairs_list = list(pair_database.items())
+    total = len(pairs_list)
+
+    # Take a rotating batch
+    start = db_scan_pointer % total
+    end   = min(start + RESERVE_BATCH_SIZE, total)
+    batch = pairs_list[start:end]
+
+    # Wrap around
+    if len(batch) < RESERVE_BATCH_SIZE and total > RESERVE_BATCH_SIZE:
+        batch += pairs_list[:RESERVE_BATCH_SIZE - len(batch)]
+
+    db_scan_pointer = end % total
+
+    logger.info(f"Reserve scan: checking {len(batch)} pairs (DB size: {total})")
+
+    flagged_tokens = []
+
+    for pair_addr, token_addr in batch:
+        try:
+            reserves = await rpc_get_reserves(session, pair_addr)
+            if not reserves:
+                continue
+
+            r0, r1 = reserves
+
+            # Skip if reserves are zero (dead pair)
+            if r0 == 0 or r1 == 0:
+                continue
+
+            prev = pair_reserves.get(pair_addr)
+
+            if not prev:
+                # First time seeing this pair — store baseline, don't alert
+                pair_reserves[pair_addr] = {
+                    "r0": r0, "r1": r1,
+                    "stable_count": 0,
+                    "last_ts": time.time(),
+                    "alerted": False
+                }
+                continue
+
+            prev_r0 = prev["r0"]
+            prev_r1 = prev["r1"]
+            stable  = prev["stable_count"]
+
+            # Calculate % change in reserves
+            change_r0 = abs(r0 - prev_r0) / prev_r0 * 100 if prev_r0 > 0 else 0
+            change_r1 = abs(r1 - prev_r1) / prev_r1 * 100 if prev_r1 > 0 else 0
+            max_change = max(change_r0, change_r1)
+
+            if max_change < RESERVE_CHANGE_PCT:
+                # Reserves stable — increment stable count
+                pair_reserves[pair_addr]["stable_count"] = min(stable + 1, 100)
+                pair_reserves[pair_addr]["r0"] = r0
+                pair_reserves[pair_addr]["r1"] = r1
+                pair_reserves[pair_addr]["last_ts"] = time.time()
+                continue
+
+            # Reserves changed — check if it was sleeping long enough
+            if stable >= RESERVE_MIN_STABLE:
+                # This is a genuine wakeup signal
+                logger.info(
+                    f"RESERVE WAKEUP: {token_addr[:10]} "
+                    f"pair {pair_addr[:10]} "
+                    f"change={round(max_change, 1)}% after {stable} stable cycles"
+                )
+                flagged_tokens.append((token_addr, pair_addr, stable, max_change))
+
+            # Update reserves
+            pair_reserves[pair_addr] = {
+                "r0": r0, "r1": r1,
+                "stable_count": 0,
+                "last_ts": time.time(),
+                "alerted": False
+            }
+
+            await asyncio.sleep(0.05)
+
+        except Exception as e:
+            logger.warning(f"Reserve check error {pair_addr[:10]}: {e}")
+
+    # Now process flagged tokens through the full pipeline
+    for token_addr, pair_addr, stable_cycles, reserve_change in flagged_tokens:
+        try:
+            if token_addr in alerted_tokens:
+                continue
+
+            # Get full market data from DexScreener
+            pair_data = await dex_token(session, token_addr)
+            if not pair_data:
+                # DexScreener doesn't have it yet — still worth alerting with what we know
+                logger.info(f"Reserve wakeup {token_addr[:10]} not yet on DexScreener")
+                continue
+
+            liq = float(pair_data.get("liquidity", {}).get("usd", 0) or 0)
+            mc  = float(pair_data.get("marketCap", 0) or 0)
+
+            if liq < MIN_LIQ_MICRO:
+                continue
+
+            dump_flag, _ = is_dump(pair_data)
+            if dump_flag:
+                continue
+
+            prev = token_history.get(token_addr)
+            acc  = score_token(pair_data, prev, True)  # treat as waking
+
+            # Build wake signal string
+            wake_signal = (
+                f"⛓ On-chain reserves moved {round(reserve_change, 1)}% "
+                f"after {stable_cycles} stable cycles — "
+                f"first trading activity detected"
+            )
+
+            report, markup = await build_report(
+                session, pair_data,
+                is_waking=True,
+                wake_signal=wake_signal,
+                reserve_detected=True
+            )
+
+            price = float(pair_data.get("priceUsd") or 0)
+            alerted_tokens[token_addr] = {"ts": time.time(), "price": price}
+
+            name = pair_data.get("baseToken", {}).get("name", "?")
+            logger.info(f"RESERVE ALERT: {name} mc=${mc:,.0f} liq=${liq:,.0f}")
+
+            for chat_id in list(subscribed_chats):
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=report,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=markup,
+                        disable_web_page_preview=True
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"Send error {chat_id}: {e}")
+
+        except Exception as e:
+            logger.warning(f"Flagged token processing error: {e}")
+
+
 # ── HTTP HELPER ───────────────────────────────────────────────────────────────
 
-async def fetch(session: aiohttp.ClientSession, url: str, headers: dict = None) -> Optional[dict]:
+async def http_get(session: aiohttp.ClientSession, url: str, headers: dict = None) -> Optional[dict]:
     try:
-        async with session.get(
-            url,
-            headers=headers or {},
-            timeout=aiohttp.ClientTimeout(total=12)
-        ) as r:
+        async with session.get(url, headers=headers or {}, timeout=aiohttp.ClientTimeout(total=12)) as r:
             if r.status == 200:
                 return await r.json()
     except Exception as e:
-        logger.warning(f"Fetch error {url[:60]}: {e}")
+        logger.warning(f"HTTP GET error {url[:60]}: {e}")
     return None
 
 
 # ── DEXSCREENER ───────────────────────────────────────────────────────────────
 
 async def dex_token(session: aiohttp.ClientSession, address: str) -> Optional[dict]:
-    """Get best BSC pair for a token from DexScreener"""
-    data = await fetch(session, f"https://api.dexscreener.com/latest/dex/tokens/{address}")
+    data = await http_get(session, f"https://api.dexscreener.com/latest/dex/tokens/{address}")
     if not data:
         return None
     pairs = [p for p in data.get("pairs", []) if p.get("chainId") == "bsc"]
@@ -214,10 +448,6 @@ async def dex_token(session: aiohttp.ClientSession, address: str) -> Optional[di
 
 
 async def fetch_bsc_pairs(session: aiohttp.ClientSession) -> list:
-    """
-    Fetch BSC pairs from DexScreener in parallel — supplementary to RPC.
-    RPC handles discovery, DexScreener provides market data.
-    """
     results = []
     seen = set()
 
@@ -229,13 +459,13 @@ async def fetch_bsc_pairs(session: aiohttp.ClientSession) -> list:
                 results.append(p)
 
     tasks = [
-        fetch(session, "https://api.dexscreener.com/latest/dex/pairs/bsc"),
-        fetch(session, "https://api.dexscreener.com/latest/dex/search?q=pancakeswap"),
-        fetch(session, "https://api.dexscreener.com/latest/dex/search?q=apeswap"),
-        fetch(session, "https://api.dexscreener.com/latest/dex/search?q=biswap"),
-        fetch(session, "https://api.dexscreener.com/token-profiles/latest/v1"),
-        fetch(session, "https://api.dexscreener.com/token-boosts/top/v1"),
-        fetch(session, "https://api.dexscreener.com/latest/dex/search?q=bsc+meme"),
+        http_get(session, "https://api.dexscreener.com/latest/dex/pairs/bsc"),
+        http_get(session, "https://api.dexscreener.com/latest/dex/search?q=pancakeswap"),
+        http_get(session, "https://api.dexscreener.com/latest/dex/search?q=apeswap"),
+        http_get(session, "https://api.dexscreener.com/latest/dex/search?q=biswap"),
+        http_get(session, "https://api.dexscreener.com/token-profiles/latest/v1"),
+        http_get(session, "https://api.dexscreener.com/token-boosts/top/v1"),
+        http_get(session, "https://api.dexscreener.com/latest/dex/search?q=bsc+meme"),
     ]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -246,33 +476,29 @@ async def fetch_bsc_pairs(session: aiohttp.ClientSession) -> list:
             if i < 4:
                 bsc = [p for p in r.get("pairs", []) if p.get("chainId") == "bsc"]
                 add(bsc[:60])
-            elif i == 4:  # profiles
-                if isinstance(r, list):
-                    bsc = [p for p in r if p.get("chainId") == "bsc"]
-                    for p in bsc[:20]:
-                        addr = p.get("tokenAddress")
-                        if addr and addr.lower() not in seen:
-                            pair = await dex_token(session, addr)
-                            if pair:
-                                seen.add(addr.lower())
-                                results.append(pair)
-            elif i == 5:  # boosts
-                if isinstance(r, list):
-                    bsc = [p for p in r if p.get("chainId") == "bsc"]
-                    for p in bsc[:10]:
-                        addr = p.get("tokenAddress")
-                        if addr and addr.lower() not in seen:
-                            pair = await dex_token(session, addr)
-                            if pair:
-                                seen.add(addr.lower())
-                                results.append(pair)
+            elif i == 4 and isinstance(r, list):
+                for p in [x for x in r if x.get("chainId") == "bsc"][:20]:
+                    addr = p.get("tokenAddress")
+                    if addr and addr.lower() not in seen:
+                        pair = await dex_token(session, addr)
+                        if pair:
+                            seen.add(addr.lower())
+                            results.append(pair)
+            elif i == 5 and isinstance(r, list):
+                for p in [x for x in r if x.get("chainId") == "bsc"][:10]:
+                    addr = p.get("tokenAddress")
+                    if addr and addr.lower() not in seen:
+                        pair = await dex_token(session, addr)
+                        if pair:
+                            seen.add(addr.lower())
+                            results.append(pair)
             else:
                 bsc = [p for p in r.get("pairs", []) if p.get("chainId") == "bsc"]
                 add(bsc[:40])
         except Exception as e:
-            logger.warning(f"DexScreener response error {i}: {e}")
+            logger.warning(f"DexScreener batch error {i}: {e}")
 
-    # Sleeping tokens from history — limited batch
+    # Re-check sleeping tokens from history
     sleeping = [
         addr for addr, h in token_history.items()
         if h.get("vol_1h", 0) < WAKE_PREV_MAX_VOL and addr.lower() not in seen
@@ -292,63 +518,60 @@ async def fetch_bsc_pairs(session: aiohttp.ClientSession) -> list:
     return results
 
 
-# ── BSCSCAN DATA ──────────────────────────────────────────────────────────────
+# ── SECURITY ──────────────────────────────────────────────────────────────────
 
-async def get_top_holders(session: aiohttp.ClientSession, address: str) -> list:
-    """
-    Get top 10 holders directly from BSCScan.
-    Returns list of {address, quantity, percentage}
-    Much more accurate than GoPlus.
-    """
-    url = (
-        f"{BSCSCAN_URL}?module=token&action=tokenholderlist"
-        f"&contractaddress={address}&page=1&offset=10&apikey={BSCSCAN_KEY}"
-    )
-    data = await fetch(session, url)
-    if data and data.get("status") == "1":
-        return data.get("result", [])
-    return []
+async def honeypot_check(session, addr):
+    return await http_get(session, f"https://api.honeypot.is/v2/IsHoneypot?address={addr}&chainID=56") or {}
 
 
-async def get_deployer(session: aiohttp.ClientSession, address: str) -> Optional[str]:
-    """Get the wallet that deployed this contract"""
-    url = (
-        f"{BSCSCAN_URL}?module=contract&action=getcontractcreation"
-        f"&contractaddresses={address}&apikey={BSCSCAN_KEY}"
-    )
-    data = await fetch(session, url)
+async def goplus_check(session, addr):
+    data = await http_get(session, f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={addr}")
+    if data:
+        r = data.get("result", {})
+        if r:
+            return list(r.values())[0]
+    return {}
+
+
+async def get_top_holders(session, addr):
+    url = (f"{BSCSCAN_URL}?module=token&action=tokenholderlist"
+           f"&contractaddress={addr}&page=1&offset=10&apikey={BSCSCAN_KEY}")
+    data = await http_get(session, url)
+    return data.get("result", []) if data and data.get("status") == "1" else []
+
+
+async def get_deployer(session, addr):
+    url = (f"{BSCSCAN_URL}?module=contract&action=getcontractcreation"
+           f"&contractaddresses={addr}&apikey={BSCSCAN_KEY}")
+    data = await http_get(session, url)
     if data and data.get("status") == "1" and data.get("result"):
         return data["result"][0].get("contractCreator")
     return None
 
 
-async def get_dev_holding(
-    session: aiohttp.ClientSession,
-    token_addr: str,
-    deployer: str,
-    total_supply: Optional[int]
-) -> Optional[float]:
-    """
-    Get deployer's current token balance as % of total supply.
-    Uses direct RPC call for accuracy.
-    """
-    if not deployer or not total_supply or total_supply == 0:
-        return None
-    balance = await rpc_balance_of(session, token_addr, deployer)
-    if balance is None:
-        return None
-    return (balance / total_supply) * 100
-
-
-async def get_contract_source(session: aiohttp.ClientSession, address: str) -> str:
-    url = (
-        f"{BSCSCAN_URL}?module=contract&action=getsourcecode"
-        f"&address={address}&apikey={BSCSCAN_KEY}"
-    )
-    data = await fetch(session, url)
+async def get_contract_source(session, addr):
+    url = (f"{BSCSCAN_URL}?module=contract&action=getsourcecode"
+           f"&address={addr}&apikey={BSCSCAN_KEY}")
+    data = await http_get(session, url)
     if data and data.get("status") == "1" and data.get("result"):
         return data["result"][0].get("SourceCode", "")
     return ""
+
+
+async def gmgn_holders(session, addr):
+    try:
+        data = await http_get(
+            session,
+            f"https://gmgn.ai/defi/quotation/v1/tokens/bsc/{addr}",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if data:
+            t = data.get("data", {}).get("token", {})
+            h = t.get("holder_count") or t.get("holders")
+            return int(h) if h else None
+    except Exception:
+        pass
+    return None
 
 
 def analyze_contract(source: str) -> dict:
@@ -364,73 +587,34 @@ def analyze_contract(source: str) -> dict:
         "selfdestruct": ("🔴 Selfdestruct", 35),
         "delegatecall": ("🔴 Dangerous proxy", 25),
     }
-    src = source.lower()
     for k, (msg, p) in checks.items():
-        if k in src:
+        if k in source.lower():
             flags.append(msg)
             score -= p
     return {"verified": True, "flags": flags, "score": max(0, score)}
 
 
-# ── SECURITY ──────────────────────────────────────────────────────────────────
-
-async def honeypot_check(session: aiohttp.ClientSession, address: str) -> dict:
-    data = await fetch(session, f"https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID=56")
-    return data or {}
-
-
-async def goplus_check(session: aiohttp.ClientSession, address: str) -> dict:
-    data = await fetch(session, f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={address}")
-    if data:
-        result = data.get("result", {})
-        if result:
-            return list(result.values())[0]
-    return {}
-
-
-async def gmgn_holders(session: aiohttp.ClientSession, address: str) -> Optional[int]:
-    try:
-        data = await fetch(
-            session,
-            f"https://gmgn.ai/defi/quotation/v1/tokens/bsc/{address}",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if data:
-            t = data.get("data", {}).get("token", {})
-            h = t.get("holder_count") or t.get("holders")
-            return int(h) if h else None
-    except Exception:
-        pass
-    return None
-
-
 def dex_paid_status(pair_data: dict) -> str:
-    """
-    Check if token has paid DexScreener promotion.
-    Boosts = paid promotion. Info badge = free community listing.
-    """
     boosts = pair_data.get("boosts", {})
     active = boosts.get("active", 0) or 0
     if active > 0:
         return f"✅ Paid — {active} active boost{'s' if active > 1 else ''}"
-    # Check if token has profile (free)
-    info = pair_data.get("info", {})
-    if info:
+    if pair_data.get("info"):
         return "ℹ️ Free listing (community submitted)"
-    return "❌ Not listed / no promotion"
+    return "❌ Not listed"
 
 
 # ── DUMP FILTER ───────────────────────────────────────────────────────────────
 
 def is_dump(pair_data: dict) -> tuple:
-    v1h     = float(pair_data.get("volume", {}).get("h1", 0) or 0)
-    c1h     = float(pair_data.get("priceChange", {}).get("h1", 0) or 0)
-    c6h     = float(pair_data.get("priceChange", {}).get("h6", 0) or 0)
-    liq     = float(pair_data.get("liquidity", {}).get("usd", 0) or 0)
-    mc      = float(pair_data.get("marketCap", 0) or 0)
-    buys    = int(pair_data.get("txns", {}).get("h1", {}).get("buys", 0) or 0)
-    sells   = int(pair_data.get("txns", {}).get("h1", {}).get("sells", 0) or 0)
-    total   = buys + sells
+    v1h   = float(pair_data.get("volume", {}).get("h1", 0) or 0)
+    c1h   = float(pair_data.get("priceChange", {}).get("h1", 0) or 0)
+    c6h   = float(pair_data.get("priceChange", {}).get("h6", 0) or 0)
+    liq   = float(pair_data.get("liquidity", {}).get("usd", 0) or 0)
+    mc    = float(pair_data.get("marketCap", 0) or 0)
+    buys  = int(pair_data.get("txns", {}).get("h1", {}).get("buys", 0) or 0)
+    sells = int(pair_data.get("txns", {}).get("h1", {}).get("sells", 0) or 0)
+    total = buys + sells
 
     if total > 8 and sells / total > MAX_SELL_RATIO:
         return True, f"Sell dominant — {round(sells/total*100)}% sells"
@@ -441,11 +625,11 @@ def is_dump(pair_data: dict) -> tuple:
     if liq > 0 and v1h > liq * 15:
         return True, "Wash trading suspected"
     if c6h > 500 and c1h < -20:
-        return True, f"Already up {c6h}% and reversing"
+        return True, f"Already pumped {c6h}% and reversing"
     return False, ""
 
 
-# ── SLEEPING GIANT ────────────────────────────────────────────────────────────
+# ── SLEEPING GIANT (DexScreener-based) ───────────────────────────────────────
 
 def is_sleeping_giant(pair_data: dict, prev: Optional[dict]) -> tuple:
     v1h = float(pair_data.get("volume", {}).get("h1", 0) or 0)
@@ -462,16 +646,16 @@ def is_sleeping_giant(pair_data: dict, prev: Optional[dict]) -> tuple:
     return False, ""
 
 
-# ── SCORE ─────────────────────────────────────────────────────────────────────
+# ── SCORING ───────────────────────────────────────────────────────────────────
 
 def score_token(pair_data: dict, prev: Optional[dict], is_waking: bool) -> dict:
     score = 0
     signals = []
     try:
-        v5m  = float(pair_data.get("volume", {}).get("m5", 0) or 0)
         v1h  = float(pair_data.get("volume", {}).get("h1", 0) or 0)
         v6h  = float(pair_data.get("volume", {}).get("h6", 0) or 0)
         v24h = float(pair_data.get("volume", {}).get("h24", 0) or 0)
+        v5m  = float(pair_data.get("volume", {}).get("m5", 0) or 0)
         c5m  = float(pair_data.get("priceChange", {}).get("m5", 0) or 0)
         c1h  = float(pair_data.get("priceChange", {}).get("h1", 0) or 0)
         c6h  = float(pair_data.get("priceChange", {}).get("h6", 0) or 0)
@@ -482,15 +666,15 @@ def score_token(pair_data: dict, prev: Optional[dict], is_waking: bool) -> dict:
 
         if is_waking:
             score += 30
-            signals.append("🚨 Sleeping giant waking up")
+            signals.append("🚨 Token waking up after silence")
 
         if v1h > 0 and v6h > 0:
             avg = v6h / 6
             if avg > 0:
                 m = v1h / avg
-                if m >= 4:   score += 20; signals.append(f"📈 Volume {round(m,1)}x the 6h avg")
-                elif m >= 2: score += 12; signals.append(f"📈 Volume {round(m,1)}x the 6h avg")
-                elif m >= 1.3: score += 6; signals.append(f"📈 Volume picking up {round(m,1)}x avg")
+                if m >= 4:    score += 20; signals.append(f"📈 Volume {round(m,1)}x the 6h avg")
+                elif m >= 2:  score += 12; signals.append(f"📈 Volume {round(m,1)}x the 6h avg")
+                elif m >= 1.3: score += 6; signals.append(f"📈 Volume picking up {round(m,1)}x")
 
         t1h = b1h + s1h
         if t1h > 3:
@@ -510,9 +694,6 @@ def score_token(pair_data: dict, prev: Optional[dict], is_waking: bool) -> dict:
         if b5m >= 8:   score += 10; signals.append(f"⚡ {b5m} buys in 5m")
         elif b5m >= 3: score += 5;  signals.append(f"⚡ {b5m} buys in 5m")
 
-        if 0 < mc <= MICRO_CAP_MAX:
-            score += 7; signals.append(f"💎 Micro cap ${mc:,.0f}")
-
         if 2000 <= v1h <= 60000:
             score += 8; signals.append(f"💎 Early volume zone ${v1h:,.0f}/hr")
 
@@ -529,7 +710,7 @@ def virality(pair_data: dict) -> dict:
     v5m   = float(pair_data.get("volume", {}).get("m5", 0) or 0)
     boost = pair_data.get("boosts", {}).get("active", 0) or 0
 
-    if b5m >= 15: score += 28; signals.append(f"🔥 {b5m} buys in 5m")
+    if b5m >= 15:  score += 28; signals.append(f"🔥 {b5m} buys in 5m")
     elif b5m >= 7: score += 15; signals.append(f"⚡ {b5m} buys in 5m")
     if b1h >= 100: score += 28; signals.append(f"📣 {b1h} buys in 1h")
     elif b1h >= 40: score += 15; signals.append(f"📣 {b1h} buys in 1h")
@@ -549,13 +730,13 @@ NARRATIVES = {
     "🐂 BSC Native": ["bnb", "binance", "pancake"],
 }
 
-def narrative(name: str, symbol: str) -> str:
+def narrative(name, symbol):
     text = f"{name} {symbol}".lower()
     found = [l for l, kws in NARRATIVES.items() if any(k in text for k in kws)]
     return " | ".join(found) if found else "None detected"
 
 
-def risk_label(is_hp, cscore, top10, gp) -> str:
+def risk_label(is_hp, cscore, top10, gp):
     if is_hp: return "🔴 CRITICAL — HONEYPOT"
     if any([
         gp.get("can_take_back_ownership","0")=="1",
@@ -569,12 +750,12 @@ def risk_label(is_hp, cscore, top10, gp) -> str:
     return "🟡 MEDIUM RISK"
 
 
-def predict(pair_data, acc, waking, dump) -> str:
+def predict(pair_data, acc, waking, dump):
     if dump: return "🔴 DUMP PATTERN — avoid"
     c1h = float(pair_data.get("priceChange", {}).get("h1", 0) or 0)
     c6h = float(pair_data.get("priceChange", {}).get("h6", 0) or 0)
-    if waking and acc >= 60: return "🚀 HIGH POTENTIAL — sleeping giant waking"
-    if waking: return "📈 WATCH — first volume appearing"
+    if waking and acc >= 60: return "🚀 HIGH POTENTIAL — waking after silence"
+    if waking: return "📈 WATCH — first activity appearing"
     if acc >= 75 and c1h > 0 and c6h > 0: return "🚀 STRONG BULLISH"
     if acc >= 55 and c1h > 0: return "📈 BULLISH — accumulation forming"
     if acc >= 40: return "🟡 EARLY SIGNAL — watch closely"
@@ -584,14 +765,16 @@ def predict(pair_data, acc, waking, dump) -> str:
 # ── FULL REPORT ───────────────────────────────────────────────────────────────
 
 async def build_report(
-    session: aiohttp.ClientSession,
+    session,
     pair_data: dict,
     is_waking: bool = False,
     wake_signal: str = "",
     is_new: bool = False,
     new_age_str: str = "",
+    reserve_detected: bool = False,
 ) -> tuple:
-    """Returns (report_text, reply_markup)"""
+    """Returns (text, InlineKeyboardMarkup)"""
+
     addr      = pair_data.get("baseToken", {}).get("address", "")
     name      = pair_data.get("baseToken", {}).get("name", "Unknown")
     symbol    = pair_data.get("baseToken", {}).get("symbol", "???")
@@ -607,16 +790,16 @@ async def build_report(
     v24h      = float(pair_data.get("volume", {}).get("h24", 0) or 0)
     c5m       = pair_data.get("priceChange", {}).get("m5", "0")
     c1h       = pair_data.get("priceChange", {}).get("h1", "0")
-    c6h       = pair_data.get("priceChange", {}).get("h6", "0")
+    c6h_s     = pair_data.get("priceChange", {}).get("h6", "0")
     c24h      = pair_data.get("priceChange", {}).get("h24", "0")
     b1h       = int(pair_data.get("txns", {}).get("h1", {}).get("buys", 0) or 0)
     s1h       = int(pair_data.get("txns", {}).get("h1", {}).get("sells", 0) or 0)
-    b5m       = int(pair_data.get("txns", {}).get("m5", {}).get("buys", 0) or 0)
-    s5m       = int(pair_data.get("txns", {}).get("m5", {}).get("sells", 0) or 0)
+    b5m_t     = int(pair_data.get("txns", {}).get("m5", {}).get("buys", 0) or 0)
+    s5m_t     = int(pair_data.get("txns", {}).get("m5", {}).get("sells", 0) or 0)
 
     ts = pair_data.get("pairCreatedAt")
     if ts:
-        ah = (time.time() - int(ts)/1000) / 3600
+        ah  = (time.time() - int(ts)/1000) / 3600
         age = f"{round(ah*60)}m" if ah < 1 else (f"{round(ah,1)}h" if ah < 48 else f"{round(ah/24,1)}d")
     else:
         age = "Unknown"
@@ -629,9 +812,14 @@ async def build_report(
     acc  = score_token(pair_data, prev, is_waking)
     vir  = virality(pair_data)
 
-    # Parallel security + holder + dev data
-    (hp_data, src, gp_data, gmgn,
-     top_holders, deployer, total_supply) = await asyncio.gather(
+    token_history[addr] = {
+        "vol_1h": v1h, "vol_24h": v24h, "price": price_str,
+        "ticker": symbol, "mcap": mc, "timestamp": time.time(),
+        "scan_count": (prev.get("scan_count",0) if prev else 0) + 1,
+    }
+
+    # Parallel security + data
+    results = await asyncio.gather(
         honeypot_check(session, addr),
         get_contract_source(session, addr),
         goplus_check(session, addr),
@@ -642,13 +830,15 @@ async def build_report(
         return_exceptions=True
     )
 
-    hp  = hp_data if isinstance(hp_data, dict) else {}
-    gp  = gp_data if isinstance(gp_data, dict) else {}
-    src = src if isinstance(src, str) else ""
-    top_holders  = top_holders if isinstance(top_holders, list) else []
-    deployer     = deployer if isinstance(deployer, str) else None
-    total_supply = total_supply if isinstance(total_supply, int) else None
-    gmgn         = gmgn if isinstance(gmgn, int) else None
+    hp_data, src, gp_data, gmgn, top_holders, deployer, total_supply = results
+
+    hp  = hp_data  if isinstance(hp_data, dict)  else {}
+    gp  = gp_data  if isinstance(gp_data, dict)  else {}
+    src = src      if isinstance(src, str)        else ""
+    top_holders   = top_holders   if isinstance(top_holders, list) else []
+    deployer      = deployer      if isinstance(deployer, str)     else None
+    total_supply  = total_supply  if isinstance(total_supply, int) else None
+    gmgn          = gmgn          if isinstance(gmgn, int)         else None
 
     is_hp         = hp.get("isHoneypot", False)
     hp_reason     = hp.get("honeypotResult", {}).get("reason", "")
@@ -656,72 +846,59 @@ async def build_report(
     sell_tax      = hp.get("simulationResult", {}).get("sellTax")
     contract      = analyze_contract(src)
     renounced     = gp.get("owner_address","") == "0x0000000000000000000000000000000000000000"
-    can_take_back = gp.get("can_take_back_ownership","0") == "1"
     is_mintable   = gp.get("is_mintable","0") == "1"
     is_proxy      = gp.get("is_proxy","0") == "1"
     hidden_owner  = gp.get("hidden_owner","0") == "1"
+    can_take_back = gp.get("can_take_back_ownership","0") == "1"
 
-    # Top 10 from BSCScan (accurate)
+    # Top 10 from BSCScan
     top10_pct = 0.0
     top10_str = "Unknown"
     if top_holders:
         try:
-            total_pct = sum(
-                float(h.get("percentage", 0) or 0)
-                for h in top_holders[:10]
-                if h.get("percentage")
-            )
+            pcts = [float(h.get("percentage", 0) or 0) for h in top_holders[:10]]
+            total_pct = sum(pcts)
             if total_pct > 0:
                 top10_pct = total_pct
-                top10_str = f"{round(total_pct, 1)}% (BSCScan)"
-            else:
-                # BSCScan sometimes gives TokenSupply-relative quantities
+                top10_str = f"{round(total_pct, 1)}% (BSCScan ✓)"
+            elif total_supply and total_supply > 0:
                 quantities = [int(h.get("TokenHolderQuantity", 0) or 0) for h in top_holders[:10]]
-                if total_supply and total_supply > 0 and sum(quantities) > 0:
-                    top10_pct = sum(quantities) / total_supply * 100
-                    top10_str = f"{round(top10_pct, 1)}% (BSCScan)"
+                top10_pct = sum(quantities) / total_supply * 100
+                top10_str = f"{round(top10_pct, 1)}% (BSCScan ✓)"
         except Exception as e:
-            logger.warning(f"Top holders calc error: {e}")
-            top10_str = "Calc error"
+            logger.warning(f"Top10 calc: {e}")
 
-    # Holder count cross-reference
+    # Holder count
     gp_holders = gp.get("holder_count")
     holder_sources = {}
-    if gp_holders:
-        holder_sources["GoPlus"] = int(gp_holders)
-    if gmgn:
-        holder_sources["GMGN"] = int(gmgn)
+    if gp_holders: holder_sources["GoPlus"] = int(gp_holders)
+    if gmgn:       holder_sources["GMGN"]   = int(gmgn)
     if holder_sources:
         best = max(holder_sources.values())
         if len(holder_sources) == 2:
             gv, gm = holder_sources.get("GoPlus",0), holder_sources.get("GMGN",0)
             hdisplay = f"{best:,} (GoPlus: {gv:,} | GMGN: {gm:,})"
-            if abs(gv-gm) > max(gv, gm)*0.5 and abs(gv-gm) > 50:
+            if abs(gv-gm) > max(gv,gm)*0.5 and abs(gv-gm) > 50:
                 hdisplay += " ⚠️"
         else:
             hdisplay = f"{best:,} (via {list(holder_sources.keys())[0]})"
     else:
         hdisplay = "Unknown"
 
-    # Dev holding — from deployer wallet via RPC
-    dev_pct = None
+    # Dev holding via RPC
     dev_str = "Unknown"
     if deployer and total_supply:
         dev_pct = await get_dev_holding(session, addr, deployer, total_supply)
         if dev_pct is not None:
-            dev_str = f"{round(dev_pct, 2)}% of supply"
-            if dev_pct > 20:
-                dev_str += " 🔴 HIGH"
-            elif dev_pct > 10:
-                dev_str += " ⚠️"
-            elif dev_pct == 0:
-                dev_str = "0% (sold/burned)"
-            else:
-                dev_str += " ✅"
+            dev_str = f"{round(dev_pct, 2)}%"
+            if dev_pct > 20:   dev_str += " 🔴 HIGH"
+            elif dev_pct > 10: dev_str += " ⚠️"
+            elif dev_pct == 0: dev_str = "0% (sold/burned) ✅"
+            else:              dev_str += " ✅"
         else:
-            dev_str = f"Deployer: `{deployer[:8]}...` (balance unavailable)"
+            dev_str = f"`{deployer[:10]}...` (unavailable)"
     elif deployer:
-        dev_str = f"Deployer: `{deployer[:8]}...`"
+        dev_str = f"`{deployer[:10]}...`"
 
     dex_paid = dex_paid_status(pair_data)
     dump_flag, dump_reason = is_dump(pair_data)
@@ -729,22 +906,29 @@ async def build_report(
     narr = narrative(name, symbol)
     pred = predict(pair_data, acc["score"], is_waking, dump_flag)
 
-    is_micro = 0 < mc <= MICRO_CAP_MAX
-    mc_tag   = "💎 MICRO" if is_micro else "📊 STD"
-    if is_new:    atype = f"🆕 NEW — {new_age_str}"
-    elif is_waking: atype = "💤🔥 SLEEPING GIANT"
-    else:         atype = "📡 ACCUMULATION"
+    mclabel = mc_label(mc)
+
+    # Alert type
+    if reserve_detected:
+        atype = "⛓ ON-CHAIN WAKEUP"
+    elif is_new:
+        atype = f"🆕 NEW — {new_age_str}"
+    elif is_waking:
+        atype = "💤🔥 SLEEPING GIANT"
+    else:
+        atype = "📡 ACCUMULATION"
 
     cflags = "\n".join(contract["flags"]) if contract["flags"] else "✅ No dangerous functions"
 
     msg = (
-        f"🟡 *BSC — {atype}* {mc_tag}\n"
+        f"🟡 *BSC — {atype}* {mclabel}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 *{name}* `${symbol}`\n"
         f"🏦 {dex_name} | ⏱ Age: {age}\n"
         f"📍 `{addr}`\n\n"
     )
-    if is_waking:
+
+    if wake_signal:
         msg += f"🚨 *{wake_signal}*\n\n"
 
     msg += (
@@ -753,8 +937,8 @@ async def build_report(
         f"💰 Price: ${price_str}\n"
         f"📈 MCap: ${mc:,.0f} | 💧 Liq: ${liq:,.0f} ({lm}%)\n"
         f"📦 Vol: 5m ${v5m:,.0f} | 1h ${v1h:,.0f} | 24h ${v24h:,.0f}\n"
-        f"📉 5m: {c5m}% | 1h: {c1h}% | 6h: {c6h}% | 24h: {c24h}%\n"
-        f"🔄 5m: {b5m}B/{s5m}S | 1h: {b1h}B/{s1h}S ({bp}% buys)\n\n"
+        f"📉 5m: {c5m}% | 1h: {c1h}% | 6h: {c6h_s}% | 24h: {c24h}%\n"
+        f"🔄 5m: {b5m_t}B/{s5m_t}S | 1h: {b1h}B/{s1h}S ({bp}% buys)\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🛡 *SECURITY — {risk}*\n"
         f"🍯 Honeypot: {'🔴 YES — AVOID' if is_hp else '🟢 Clean'}\n"
@@ -777,6 +961,7 @@ async def build_report(
         f"{cflags}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
+
     if dump_flag:
         msg += f"⛔ *DUMP: {dump_reason}*\n\n"
 
@@ -791,24 +976,31 @@ async def build_report(
         f"🔗 [DexScreener]({dex_url}) | [BSCScan](https://bscscan.com/token/{addr})"
     )
 
-    # Eye button — tap to watch this token for 50%+ move re-alerts
-    keyboard = InlineKeyboardMarkup([[
+    markup = InlineKeyboardMarkup([[
         InlineKeyboardButton(
-            "👁 Watch this token",
-            callback_data=f"watch_{addr}_{price_str}"
+            "⭐ Add to Favlist",
+            callback_data=f"addfav_{addr}"
         )
     ]])
 
-    return msg, keyboard
+    return msg, markup
 
 
-# ── RPC SCAN — NEW PAIR DISCOVERY ─────────────────────────────────────────────
+# ── HELPER: dev holding ───────────────────────────────────────────────────────
+
+async def get_dev_holding(session, token_addr, deployer, total_supply):
+    if not deployer or not total_supply or total_supply == 0:
+        return None
+    balance = await rpc_balance_of(session, token_addr, deployer)
+    if balance is None:
+        return None
+    return (balance / total_supply) * 100
+
+
+# ── RPC NEW PAIR SCAN ─────────────────────────────────────────────────────────
 
 async def rpc_scan_new_pairs(session: aiohttp.ClientSession, app: Application):
-    """
-    Directly monitor PancakeSwap V2 factory for new pair creation events.
-    This catches tokens the moment they're created — no DexScreener dependency.
-    """
+    """Detect brand new pairs directly from blockchain events"""
     global last_rpc_block
 
     if not subscribed_chats:
@@ -816,13 +1008,11 @@ async def rpc_scan_new_pairs(session: aiohttp.ClientSession, app: Application):
 
     current_block = await rpc_block_number(session)
     if not current_block:
-        logger.warning("Could not get block number")
         return
 
     if last_rpc_block == 0:
-        last_rpc_block = current_block - 100  # start from last 100 blocks on first run
+        last_rpc_block = current_block - 150
 
-    # Don't scan too many blocks at once
     from_block = last_rpc_block + 1
     to_block   = min(current_block, from_block + 200)
 
@@ -835,25 +1025,31 @@ async def rpc_scan_new_pairs(session: aiohttp.ClientSession, app: Application):
     if not logs:
         return
 
-    logger.info(f"RPC: {len(logs)} new pairs found in blocks {from_block}-{to_block}")
+    logger.info(f"RPC: {len(logs)} new pairs in blocks {from_block}-{to_block}")
 
     for log in logs:
         try:
-            token_addr = parse_pair_created_log(log)
-            if not token_addr:
+            parsed = parse_pair_log(log)
+            if not parsed:
+                continue
+            pair_addr, token_addr = parsed
+
+            # Add to pair DB immediately for future reserve monitoring
+            if pair_addr not in pair_database:
+                pair_database[pair_addr] = token_addr
+
+            if token_addr in alerted_tokens or token_addr in seen_new_pairs:
                 continue
 
-            # Wait a moment for DexScreener to index it
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)  # let DexScreener index it
 
             pair_data = await dex_token(session, token_addr)
             if not pair_data:
-                # DexScreener hasn't indexed yet — add to history for later pickup
                 token_history[token_addr] = {
                     "vol_1h": 0, "vol_24h": 0, "price": None,
-                    "ticker": "???", "timestamp": time.time(), "scan_count": 0,
+                    "ticker": "???", "mcap": 0,
+                    "timestamp": time.time(), "scan_count": 0,
                 }
-                logger.info(f"New pair from RPC (not yet on DexScreener): {token_addr[:10]}")
                 continue
 
             liq = float(pair_data.get("liquidity", {}).get("usd", 0) or 0)
@@ -864,42 +1060,25 @@ async def rpc_scan_new_pairs(session: aiohttp.ClientSession, app: Application):
             if dump_flag:
                 continue
 
-            if token_addr in seen_new_pairs:
+            prev = token_history.get(token_addr)
+            acc  = score_token(pair_data, prev, False)
+            if acc["score"] < MIN_SCORE_NEW:
                 continue
 
             ts = pair_data.get("pairCreatedAt")
             age_h = (time.time() - int(ts)/1000) / 3600 if ts else 0
             new_age_str = f"{round(age_h*60)}m old" if age_h < 1 else f"{round(age_h,1)}h old"
 
-            prev = token_history.get(token_addr)
-            acc  = score_token(pair_data, prev, False)
-
-            token_history[token_addr] = {
-                "vol_1h": float(pair_data.get("volume", {}).get("h1", 0) or 0),
-                "vol_24h": float(pair_data.get("volume", {}).get("h24", 0) or 0),
-                "price": pair_data.get("priceUsd"),
-                "ticker": pair_data.get("baseToken", {}).get("symbol", "???"),
-                "timestamp": time.time(),
-                "scan_count": 1,
-            }
-
-            if acc["score"] < MIN_SCORE_NEW:
-                continue
-            if token_addr in alerted_tokens:
-                continue
-
             seen_new_pairs.add(token_addr)
+            mc = float(pair_data.get("marketCap", 0) or 0)
             name = pair_data.get("baseToken", {}).get("name", "?")
-            mc   = float(pair_data.get("marketCap", 0) or 0)
-            logger.info(f"RPC NEW PAIR ALERT: {name} mc=${mc:,.0f} score={acc['score']}")
+            logger.info(f"RPC NEW PAIR: {name} mc=${mc:,.0f} score={acc['score']}")
 
             report, markup = await build_report(
                 session, pair_data, is_new=True, new_age_str=new_age_str
             )
-            alerted_tokens[token_addr] = {
-                "ts": time.time(),
-                "price": float(pair_data.get("priceUsd") or 0)
-            }
+            price = float(pair_data.get("priceUsd") or 0)
+            alerted_tokens[token_addr] = {"ts": time.time(), "price": price}
 
             for chat_id in list(subscribed_chats):
                 try:
@@ -914,31 +1093,31 @@ async def rpc_scan_new_pairs(session: aiohttp.ClientSession, app: Application):
                     logger.warning(f"Send error {chat_id}: {e}")
 
         except Exception as e:
-            logger.warning(f"RPC pair processing error: {e}")
+            logger.warning(f"RPC pair error: {e}")
 
 
-# ── MAIN SCAN LOOP ────────────────────────────────────────────────────────────
+# ── MAIN DEXSCREENER SCAN ─────────────────────────────────────────────────────
 
 async def run_scan(session: aiohttp.ClientSession, app: Application):
     if not subscribed_chats:
         return
 
-    logger.info("Scan cycle...")
+    logger.info("DexScreener scan...")
     pairs = await fetch_bsc_pairs(session)
 
     for pair_data in pairs:
         try:
-            addr   = pair_data.get("baseToken", {}).get("address", "")
-            liq    = float(pair_data.get("liquidity", {}).get("usd", 0) or 0)
-            mc     = float(pair_data.get("marketCap", 0) or 0)
-            v1h    = float(pair_data.get("volume", {}).get("h1", 0) or 0)
-            v24h   = float(pair_data.get("volume", {}).get("h24", 0) or 0)
-            price  = float(pair_data.get("priceUsd") or 0)
+            addr  = pair_data.get("baseToken", {}).get("address", "")
+            liq   = float(pair_data.get("liquidity", {}).get("usd", 0) or 0)
+            mc    = float(pair_data.get("marketCap", 0) or 0)
+            v1h   = float(pair_data.get("volume", {}).get("h1", 0) or 0)
+            v24h  = float(pair_data.get("volume", {}).get("h24", 0) or 0)
+            price = float(pair_data.get("priceUsd") or 0)
 
             if not addr:
                 continue
 
-            is_micro = 0 < mc <= MICRO_CAP_MAX
+            is_micro = mc <= 200_000
             min_liq  = MIN_LIQ_MICRO if is_micro else MIN_LIQ_STD
 
             prev = token_history.get(addr)
@@ -946,15 +1125,14 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
                 "vol_1h": v1h, "vol_24h": v24h,
                 "price": pair_data.get("priceUsd"),
                 "ticker": pair_data.get("baseToken", {}).get("symbol", "???"),
-                "mcap": mc,
-                "timestamp": time.time(),
+                "mcap": mc, "timestamp": time.time(),
                 "scan_count": (prev.get("scan_count",0) if prev else 0) + 1,
             }
 
             if liq < min_liq:
                 continue
 
-            dump_flag, dump_reason = is_dump(pair_data)
+            dump_flag, _ = is_dump(pair_data)
             if dump_flag:
                 continue
 
@@ -970,7 +1148,6 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
             is_waking, wake_signal = is_sleeping_giant(pair_data, prev)
             acc = score_token(pair_data, prev, is_waking)
 
-            # Alert decision
             should_alert = False
             if is_new_flag and acc["score"] >= MIN_SCORE_NEW:
                 should_alert = True
@@ -983,28 +1160,18 @@ async def run_scan(session: aiohttp.ClientSession, app: Application):
             if not should_alert:
                 continue
 
-            # One alert per token — permanent block unless watched or in favs
-            already_alerted = addr in alerted_tokens
+            # One alert per token — permanent unless in favlist
+            already = addr in alerted_tokens
+            is_faved = any(addr in favourites.get(cid, {}) for cid in subscribed_chats)
 
-            # Check if in any chat's fav or watch list
-            is_watched = any(
-                addr in watched_tokens.get(cid, {})
-                for cid in subscribed_chats
-            )
-            is_faved = any(
-                addr in favourites.get(cid, {})
-                for cid in subscribed_chats
-            )
-
-            if already_alerted and not is_watched and not is_faved:
+            if already and not is_faved:
                 continue
 
-            # If watched/faved, check 50% move threshold
-            if already_alerted and (is_watched or is_faved):
+            if already and is_faved:
                 last_price = alerted_tokens[addr].get("price", 0)
                 if last_price > 0 and price > 0:
                     move = abs((price - last_price) / last_price * 100)
-                    if move < WATCH_ALERT_PCT:
+                    if move < FAV_ALERT_PCT:
                         continue
 
             name = pair_data.get("baseToken", {}).get("name", "?")
@@ -1038,7 +1205,7 @@ async def check_fav_moves(app: Application):
         return
     async with aiohttp.ClientSession() as session:
         for chat_id, favs in favourites.items():
-            for addr, info in favs.items():
+            for addr, info in list(favs.items()):
                 try:
                     pair = await dex_token(session, addr)
                     if not pair:
@@ -1052,12 +1219,12 @@ async def check_fav_moves(app: Application):
                         if time.time() - alerted_tokens.get(key, {}).get("ts", 0) < 3600:
                             continue
                         alerted_tokens[key] = {"ts": time.time(), "price": 0}
-                        direction = "🚀 UP" if c1h > 0 else "🔴 DOWN"
+                        d = "🚀 UP" if c1h > 0 else "🔴 DOWN"
                         await app.bot.send_message(
                             chat_id=chat_id,
                             text=(
                                 f"⭐ *FAV ALERT — {ticker}*\n\n"
-                                f"Moved {direction} *{c1h}%* in 1h\n"
+                                f"Moved {d} *{c1h}%* in 1h\n"
                                 f"💰 Price: ${price}\n\n"
                                 f"[View on DexScreener]({url})"
                             ),
@@ -1065,64 +1232,58 @@ async def check_fav_moves(app: Application):
                             disable_web_page_preview=True
                         )
                 except Exception as e:
-                    logger.warning(f"Fav move check error {addr}: {e}")
+                    logger.warning(f"Fav move error {addr}: {e}")
 
 
-# ── EYE BUTTON CALLBACK ───────────────────────────────────────────────────────
+# ── BUTTON CALLBACKS ──────────────────────────────────────────────────────────
 
-async def handle_watch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
+async def handle_addfav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
     chat_id = query.message.chat_id
-    data    = query.data  # format: watch_{addr}_{price}
 
     try:
-        parts  = data.split("_", 2)
-        addr   = parts[1]
-        price  = float(parts[2]) if len(parts) > 2 else 0
+        addr = query.data.split("_", 1)[1]
     except Exception:
-        await query.answer("Error parsing token data.", show_alert=True)
+        await query.answer("Error reading token address.", show_alert=True)
         return
 
-    if chat_id not in watched_tokens:
-        watched_tokens[chat_id] = {}
+    if chat_id not in favourites:
+        favourites[chat_id] = {}
 
-    if addr in watched_tokens[chat_id]:
-        # Toggle off
-        ticker = token_history.get(addr, {}).get("ticker", addr[:8])
-        del watched_tokens[chat_id][addr]
+    if addr in favourites[chat_id]:
+        await query.answer("Already in your Favlist ⭐", show_alert=False)
+        return
+
+    # Get ticker from history or DexScreener
+    ticker = token_history.get(addr, {}).get("ticker", "???")
+    price  = float(token_history.get(addr, {}).get("price") or 0)
+
+    favourites[chat_id][addr] = {
+        "ticker": ticker,
+        "added_ts": time.time(),
+        "last_price": price,
+    }
+
+    await query.answer(f"⭐ Added ${ticker} to Favlist!", show_alert=False)
+
+    # Update button to show it's added
+    try:
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👁 Watch this token", callback_data=f"watch_{addr}_{price}")
+            InlineKeyboardButton("⭐ In Favlist ✅", callback_data=f"addfav_{addr}")
         ]]))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"👁 Stopped watching *${ticker}*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        # Toggle on
-        watched_tokens[chat_id][addr] = {"alert_price": price, "added_ts": time.time()}
-        ticker = token_history.get(addr, {}).get("ticker", addr[:8])
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👁 Watching ✅ (tap to stop)", callback_data=f"watch_{addr}_{price}")
-        ]]))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"👁 Now watching *${ticker}*\n\n"
-                f"I'll alert you again if it moves ±{WATCH_ALERT_PCT}% from current price."
-            ),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    except Exception:
+        pass
+
+    # Refresh pinned board
+    await update_pinned_favs(context.application, chat_id)
 
 
-# ── FAVOURITES ────────────────────────────────────────────────────────────────
+# ── FAVOURITES BOARD ──────────────────────────────────────────────────────────
 
-async def build_fav_board(session: aiohttp.ClientSession, chat_id: int) -> str:
+async def build_fav_board(session, chat_id: int) -> str:
     favs = favourites.get(chat_id, {})
     if not favs:
-        return "⭐ *FAVOURITES*\n\nEmpty. Use /fav <address> to add tokens."
+        return "⭐ *FAVOURITES*\n\nEmpty. Tap ⭐ on any alert to add a token."
     lines = ["⭐ *FAVOURITES — LIVE*\n"]
     for addr, info in favs.items():
         pair = await dex_token(session, addr)
@@ -1139,7 +1300,7 @@ async def build_fav_board(session: aiohttp.ClientSession, chat_id: int) -> str:
             e = "🟢" if float(c1h or 0) >= 0 else "🔴"
             lines.append(
                 f"[${ticker}]({url})\n"
-                f"💰 ${price} | MCap: ${mc:,.0f}\n"
+                f"💰 ${price} | MCap: ${mc:,.0f} {mc_label(mc)}\n"
                 f"📦 Vol 1h: ${v1h:,.0f} | 💧 Liq: ${liq:,.0f}\n"
                 f"{e} 1h: {c1h}% | 24h: {c24h}%\n"
                 f"`{addr}`\n"
@@ -1183,24 +1344,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BotCommand("start",     "Activate scanner"),
         BotCommand("stop",      "Pause alerts"),
         BotCommand("scan",      "Scan any BSC token"),
-        BotCommand("watchlist", "View tracked tokens"),
-        BotCommand("fav",       "Add to favourites"),
+        BotCommand("watchlist", "View tracked tokens by MCap"),
+        BotCommand("fav",       "Add token to favourites"),
         BotCommand("unfav",     "Remove from favourites"),
         BotCommand("favlist",   "Live prices for favourites"),
-        BotCommand("status",    "Scanner stats"),
+        BotCommand("status",    "Scanner stats + DB size"),
         BotCommand("filters",   "Current settings"),
     ])
     await update.message.reply_text(
-        "🟡 *BSC MEME SCANNER v4 ACTIVATED*\n\n"
-        "Now using direct RPC blockchain monitoring.\n"
-        "Catches tokens the moment they're created on PancakeSwap,\n"
-        "and tracks ALL existing tokens for wakeup signals.\n\n"
-        "Hunting:\n"
-        "• 🆕 New pairs — direct from blockchain\n"
-        "• 💤🔥 Sleeping tokens waking up — any age\n"
-        "• 💎 Micro caps showing early volume\n"
-        "• 📈 Accumulation patterns\n\n"
-        "One alert per token. Tap 👁 to keep watching.\n"
+        "🟡 *IMPULSE BSC SCANNER v5*\n\n"
+        "⛓ Now monitors on-chain reserves directly.\n"
+        "Old tokens moving at $30k MC — caught before DexScreener.\n\n"
+        "Three detection layers:\n"
+        "• ⛓ On-chain reserve changes (old tokens, any age)\n"
+        "• 🆕 New pairs direct from blockchain\n"
+        "• 📡 DexScreener accumulation signals\n\n"
+        "One alert per token. Tap ⭐ to add to Favlist.\n"
+        "Favlist tokens re-alert on ±50% moves.\n\n"
         "Use menu below ↓",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -1212,16 +1372,14 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    watched_count = sum(len(v) for v in watched_tokens.values())
-    fav_count     = sum(len(v) for v in favourites.values())
+    fav_count = sum(len(v) for v in favourites.values())
     await update.message.reply_text(
-        f"*BSC SCANNER STATUS*\n\n"
-        f"✅ Running | 📡 RPC + DexScreener\n"
-        f"⏱ DexScreener scan: {SCAN_INTERVAL}s\n"
-        f"⛓ RPC new-pair scan: {RPC_SCAN_INTERVAL}s\n"
-        f"🪙 Tokens in memory: {len(token_history)}\n"
-        f"🔔 Alerted: {len(alerted_tokens)}\n"
-        f"👁 Watched: {watched_count}\n"
+        f"*IMPULSE BSC v5 STATUS*\n\n"
+        f"✅ Running\n"
+        f"⛓ Pair DB: {len(pair_database):,} pairs monitored\n"
+        f"📊 Reserve snapshots: {len(pair_reserves):,}\n"
+        f"🪙 Tokens in memory: {len(token_history):,}\n"
+        f"🔔 Alerts sent: {len(alerted_tokens):,}\n"
         f"⭐ Favourites: {fav_count}\n"
         f"👥 Subscribers: {len(subscribed_chats)}\n"
         f"⛓ Last block: {last_rpc_block:,}",
@@ -1231,17 +1389,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"*BSC FILTERS*\n\n"
-        f"🆕 New pairs (≤{NEW_PAIR_MAX_AGE_H}h): score ≥{MIN_SCORE_NEW}\n"
+        f"*IMPULSE FILTERS*\n\n"
+        f"⛓ *On-chain reserve monitoring*\n"
+        f"  DB lookback: {DB_LOOKBACK_DAYS} days\n"
+        f"  Reserve change threshold: {RESERVE_CHANGE_PCT}%\n"
+        f"  Min stable cycles before alert: {RESERVE_MIN_STABLE}\n"
+        f"  Batch size: {RESERVE_BATCH_SIZE} pairs/cycle\n\n"
+        f"🆕 New pairs: score ≥{MIN_SCORE_NEW}\n"
         f"💤 Sleeping giant: score ≥{MIN_SCORE_WAKE}\n"
         f"📊 Standard: score ≥{MIN_SCORE_STD}\n\n"
-        f"💧 Min liq micro: ${MIN_LIQ_MICRO:,}\n"
-        f"💧 Min liq standard: ${MIN_LIQ_STD:,}\n"
-        f"💎 Micro cap ceiling: ${MICRO_CAP_MAX:,}\n\n"
-        f"⛔ Max sell ratio: {round(MAX_SELL_RATIO*100)}%\n"
-        f"⛔ Max drop 1h: {MAX_DROP_1H}%\n\n"
-        f"👁 Re-alert threshold: ±{WATCH_ALERT_PCT}%\n"
-        f"⭐ Fav alert threshold: ±{FAV_ALERT_PCT}%",
+        f"💧 Min liq (micro): ${MIN_LIQ_MICRO:,}\n"
+        f"💧 Min liq (standard): ${MIN_LIQ_STD:,}\n\n"
+        f"⭐ Fav re-alert: ±{FAV_ALERT_PCT}% move in 1h\n\n"
+        f"*MC Labels*\n"
+        f"🔬 Micro: under $20k\n"
+        f"💎 Low: $20k–$100k\n"
+        f"📊 Low-Mid: $100k–$200k\n"
+        f"📈 Mid Cap: $200k–$1m\n"
+        f"🔥 High Cap: $1m–$20m\n"
+        f"🏆 Very High: $20m+",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -1250,24 +1416,22 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not token_history:
         await update.message.reply_text("No tokens in memory yet. Give it a few minutes.")
         return
-
     sorted_tokens = sorted(
         token_history.items(),
         key=lambda x: x[1].get("mcap", 0),
         reverse=True
     )[:20]
-
     lines = ["*TOP 20 TRACKED TOKENS BY MCAP*\n"]
     for addr, h in sorted_tokens:
         mc     = h.get("mcap", 0)
         scans  = h.get("scan_count", 0)
         ticker = h.get("ticker", "???")
         link   = f"https://dexscreener.com/bsc/{addr}"
+        label  = mc_label(mc)
         lines.append(
             f"[${ticker}]({link})\n"
-            f"`{addr}` | MCap: ${mc:,.0f} | Scans: {scans}"
+            f"`{addr}` | ${mc:,.0f} {label} | Scans: {scans}"
         )
-
     await update.message.reply_text(
         "\n\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
@@ -1317,7 +1481,7 @@ async def cmd_unfav(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_favlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not favourites.get(chat_id):
-        await update.message.reply_text("No favourites. Use /fav <address> to add.")
+        await update.message.reply_text("No favourites. Tap ⭐ on any alert or use /fav <address>.")
         return
     msg = await update.message.reply_text("⭐ Fetching live data...")
     async with aiohttp.ClientSession() as session:
@@ -1366,24 +1530,35 @@ def main():
     app.add_handler(CommandHandler("fav",       cmd_fav))
     app.add_handler(CommandHandler("unfav",     cmd_unfav))
     app.add_handler(CommandHandler("favlist",   cmd_favlist))
-    app.add_handler(CallbackQueryHandler(handle_watch_callback, pattern=r"^watch_"))
+    app.add_handler(CallbackQueryHandler(handle_addfav_callback, pattern=r"^addfav_"))
 
-    async def dex_scan_job(ctx):
+    async def dex_job(ctx):
         async with aiohttp.ClientSession() as session:
             await run_scan(session, app)
 
-    async def rpc_scan_job(ctx):
+    async def rpc_new_pair_job(ctx):
         async with aiohttp.ClientSession() as session:
             await rpc_scan_new_pairs(session, app)
+
+    async def reserve_job(ctx):
+        async with aiohttp.ClientSession() as session:
+            await scan_reserves(session, app)
+
+    async def db_build_job(ctx):
+        async with aiohttp.ClientSession() as session:
+            await build_pair_database(session)
 
     async def fav_job(ctx):
         await check_fav_moves(app)
 
-    app.job_queue.run_repeating(dex_scan_job, interval=SCAN_INTERVAL,     first=15)
-    app.job_queue.run_repeating(rpc_scan_job, interval=RPC_SCAN_INTERVAL, first=10)
-    app.job_queue.run_repeating(fav_job,      interval=FAV_CHECK_INTERVAL, first=90)
+    # Stagger job starts so they don't all hit at once
+    app.job_queue.run_repeating(db_build_job,      interval=DB_BUILD_INTERVAL,    first=5)
+    app.job_queue.run_repeating(rpc_new_pair_job,  interval=RPC_NEW_PAIR_INTERVAL, first=10)
+    app.job_queue.run_repeating(reserve_job,       interval=RESERVE_SCAN_INTERVAL, first=30)
+    app.job_queue.run_repeating(dex_job,           interval=SCAN_INTERVAL,         first=20)
+    app.job_queue.run_repeating(fav_job,           interval=FAV_CHECK_INTERVAL,    first=90)
 
-    logger.info("BSC Scanner v4 starting — RPC + DexScreener")
+    logger.info("IMPULSE BSC v5 starting — RPC reserve monitoring active")
     app.run_polling(drop_pending_updates=True)
 
 
